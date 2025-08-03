@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.4
+# Meme Coin Day Trader Bot by Grok - Version 3.7.5
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
-# Selects top 5 meme coins by 24h trading volume on KuCoin via /api/v1/market/stats, filtered for known meme coins.
+# Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
-# Sells for small profits initially (0.02% above EMA); if profit >50% of invested, increases sell threshold to 0.1% for volume focus.
+# Sells for small profits initially (0.01% above EMA); if profit >50% of invested, increases sell threshold to 0.05% for volume focus.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
 # Main dashboard with borders, colors, and simple meme icons; shows live deviation.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
-# KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT.
-# Changes from v3.7.3: Uses KuCoin /market/stats for top 5 meme coins by volume; enhanced logging for coin selection; no fallback.
+# KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT, with reconnection.
+# Changes from v3.7.4: Fixed endpoint to /api/v1/market/allTickers; lowered thresholds to 0.01%; added API retry logic; verbose logging.
 
 import requests
 import websocket
@@ -31,15 +31,18 @@ INITIAL_BALANCE = 50.0  # Total investable, $10 per coin x 5
 INITIAL_BUY_USD = 1.0  # Initial buy-in per coin
 TRADE_AMOUNT_USD = 1.0  # Subsequent trade size
 MAX_ALLOC_PER_COIN = 10.0  # Max invested per coin
-THRESHOLD_PCT_BUY = 0.02  # Buy if below EMA by this % (lowered for more trades)
-THRESHOLD_PCT_SELL_BASE = 0.02  # Base sell threshold (lowered)
-THRESHOLD_PCT_SELL_HIGH = 0.1  # Higher threshold when profit >50% (adjusted)
+THRESHOLD_PCT_BUY = 0.01  # Buy if below EMA by this % (lowered for more trades)
+THRESHOLD_PCT_SELL_BASE = 0.01  # Base sell threshold (lowered)
+THRESHOLD_PCT_SELL_HIGH = 0.05  # Higher threshold when profit >50% (adjusted)
 PROFIT_HIGH_MARK = 0.5  # 50% profit on invested to trigger higher sell goal
 EMA_PERIOD = 60
 NUM_COINS_TO_TRACK = 5
 FEE_PCT = 0.001  # 0.1% fee per trade (KuCoin spot approx)
 PADDING = 2  # Left padding for display strings to avoid cutoff
 MAX_INITIAL_RETRIES = 20  # Retry initial buys up to 20 times for slower data loads
+WEBSOCKET_RECONNECT_DELAY = 5  # Seconds to wait before reconnecting WebSocket
+API_RETRY_ATTEMPTS = 3  # Retry API calls on failure
+API_RETRY_DELAY = 2  # Seconds between retries
 
 # Section: Global Data
 # Stores runtime data like prices, balances, logs, etc., shared across threads and functions.
@@ -57,6 +60,7 @@ total_profit = 0.0
 total_trades = 0
 debug_logs = []
 deviations = {}  # For live dashboard display
+ws = None  # Global WebSocket for reconnection
 
 # Section: Exchange Setup
 # Initializes ccxt for KuCoin to check markets and pairs.
@@ -64,43 +68,51 @@ deviations = {}  # For live dashboard display
 exchange = ccxt.kucoin()
 
 # Section: Coin Selection
-# Fetches top coins by 24h volume from KuCoin /api/v1/market/stats, filters for known meme coins, selects up to 5 with /USDT pairs.
-# No fallback—if none found, logs warning and pauses trading.
-# Known meme coins for filtering
-MEME_COINS = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'MOG', 'CRO', 'GME'}
+# Fetches all tickers from KuCoin /api/v1/market/allTickers, filters for known meme coins with USDT pairs, selects top 5 by 24h volume.
+# Known meme coins for filtering (expanded list, all on KuCoin)
+MEME_COINS = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'MOG', 'CRO', 'GME', 'TRUMP', 'BOME', 'DEGEN', 'MEW', 'SLERF', 'MYRO', 'MAGA', 'TURBO', 'MOTHER', 'KITTY'}
 
 def get_top_volume_meme_coins():
-    url = "https://api.kucoin.com/api/v1/market/stats"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if 'data' not in data:
-            raise Exception("Invalid response format")
-    except Exception as e:
-        print(f"Error fetching KuCoin market stats: {e}")
-        logging.error(f"KuCoin market stats fetch failed: {e}")
-        trade_logs.append("KuCoin market stats fetch failed - no coins selected.")
-        return []
+    url = "https://api.kucoin.com/api/v1/market/allTickers"
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+            if 'data' not in data or 'ticker' not in data['data']:
+                raise Exception("Invalid response format")
+            break
+        except Exception as e:
+            print(f"Error fetching KuCoin allTickers (attempt {attempt + 1}): {e}")
+            logging.error(f"KuCoin allTickers fetch failed (attempt {attempt + 1}): {e}")
+            if attempt < API_RETRY_ATTEMPTS - 1:
+                time.sleep(API_RETRY_DELAY)
+            else:
+                trade_logs.append("KuCoin allTickers fetch failed after retries - no coins selected.")
+                logging.error("KuCoin allTickers fetch failed after retries.")
+                return []
 
-    # Sort by 24h volume (quoteVolume) descending
+    # Extract candidates
     candidates = []
-    for item in data['data']:
+    for item in data['data']['ticker']:
         symbol_pair = item['symbol']
         if symbol_pair.endswith('-USDT'):
             symbol = symbol_pair.replace('-USDT', '')
             if symbol in MEME_COINS:
                 candidates.append({
-                    'name': symbol,  # KuCoin doesn't provide full name, use symbol
+                    'name': symbol,  # Use symbol as name (allTickers doesn't provide full name)
                     'symbol': symbol,
-                    'id': symbol.lower(),  # Placeholder for consistency
+                    'id': symbol.lower(),
                     'kucoin_symbol': symbol_pair,
-                    '24h_change': float(item.get('changeRate', 0)) * 100  # Convert to %
+                    '24h_change': float(item.get('changeRate', 0)) * 100,  # Convert to %
+                    'volValue': float(item.get('volValue', 0))  # Store volume for sorting
                 })
-                logging.debug(f"Volume candidate: {symbol} (volume: {item['quoteVolume']}, change: {item['changeRate']})")
+                logging.debug(f"Volume candidate: {symbol} (volume: {item['volValue']}, change: {item['changeRate']})")
+            else:
+                logging.debug(f"Skipped {symbol} - not a meme coin")
 
-    # Sort by volume and limit to 5
-    candidates.sort(key=lambda x: float(data['data'][data['data'].index({'symbol': x['kucoin_symbol']})]['quoteVolume']), reverse=True)
+    # Sort by 24h volume (volValue) descending and limit to 5
+    candidates.sort(key=lambda x: x['volValue'], reverse=True)
     selected = candidates[:NUM_COINS_TO_TRACK]
 
     if selected:
@@ -108,7 +120,7 @@ def get_top_volume_meme_coins():
         trade_logs.append(log)
         logging.info(log)
     else:
-        log = "No meme coins with high volume available on KuCoin - no trades will occur."
+        log = "No meme coins with volume available on KuCoin - no trades will occur. Check bot_logs.txt for details."
         trade_logs.append(log)
         logging.warning(log)
     return selected
@@ -134,15 +146,23 @@ for coin in coins:
 # Fetches public token from KuCoin API, then connects to WebSocket for real-time tickers.
 def get_kucoin_token():
     url = "https://api.kucoin.com/api/v1/bullet-public"
-    response = requests.post(url)
-    data = response.json()
-    if 'data' in data and 'token' in data['data']:
-        return data['data']['token']
-    else:
-        raise Exception("Failed to fetch KuCoin public token")
-
-token = get_kucoin_token()
-ws_url = f"wss://ws-api.kucoin.com/endpoint?token={token}"
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            response = requests.post(url)
+            response.raise_for_status()
+            data = response.json()
+            if 'data' in data and 'token' in data['data']:
+                return data['data']['token']
+            else:
+                raise Exception("Invalid response format")
+        except Exception as e:
+            print(f"Error fetching KuCoin token (attempt {attempt + 1}): {e}")
+            logging.error(f"KuCoin token fetch failed (attempt {attempt + 1}): {e}")
+            if attempt < API_RETRY_ATTEMPTS - 1:
+                time.sleep(API_RETRY_DELAY)
+            else:
+                raise Exception("Failed to fetch KuCoin public token after retries")
+    return None
 
 # Section: WebSocket Handling
 # Callbacks for real-time price updates from KuCoin via WebSocket.
@@ -174,7 +194,9 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed")
-    logging.info("WebSocket closed")
+    logging.info("WebSocket closed - reconnecting...")
+    time.sleep(WEBSOCKET_RECONNECT_DELAY)
+    run_ws()  # Reconnect
 
 def on_open(ws):
     log = "WebSocket opened - subscribing to tickers..."
@@ -188,9 +210,12 @@ def on_open(ws):
     ws.send(json.dumps(subs))
 
 # Section: WebSocket Runner
-# Starts the WebSocket thread for live data streaming.
+# Starts the WebSocket thread for live data streaming, with reconnection.
 # Run WebSocket
 def run_ws():
+    global ws
+    token = get_kucoin_token()
+    ws_url = f"wss://ws-api.kucoin.com/endpoint?token={token}"
     ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
