@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.3
+# Meme Coin Day Trader Bot by Grok - Version 3.7.4
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
-# Selects top 5 trending coins at runtime via CoinGecko /search/trending, filtered for KuCoin /USDT pairs (loosened meme filter for better selection; no fallback).
+# Selects top 5 meme coins by 24h trading volume on KuCoin via /api/v1/market/stats, filtered for known meme coins.
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
 # Sells for small profits initially (0.02% above EMA); if profit >50% of invested, increases sell threshold to 0.1% for volume focus.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
-# Main dashboard with borders, colors, and simple meme icons; added live deviation display.
+# Main dashboard with borders, colors, and simple meme icons; shows live deviation.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
 # KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT.
-# Changes from v3.7.2: Loosened trending filter (no strict meme check); ignored invalid keys; lowered thresholds to 0.02%; extended initial retries; verbose selection logging.
+# Changes from v3.7.3: Uses KuCoin /market/stats for top 5 meme coins by volume; enhanced logging for coin selection; no fallback.
 
 import requests
 import websocket
@@ -39,7 +39,7 @@ EMA_PERIOD = 60
 NUM_COINS_TO_TRACK = 5
 FEE_PCT = 0.001  # 0.1% fee per trade (KuCoin spot approx)
 PADDING = 2  # Left padding for display strings to avoid cutoff
-MAX_INITIAL_RETRIES = 20  # Extended retry initial buys up to 20 times for slower data loads
+MAX_INITIAL_RETRIES = 20  # Retry initial buys up to 20 times for slower data loads
 
 # Section: Global Data
 # Stores runtime data like prices, balances, logs, etc., shared across threads and functions.
@@ -64,60 +64,56 @@ deviations = {}  # For live dashboard display
 exchange = ccxt.kucoin()
 
 # Section: Coin Selection
-# Fetches trending coins from CoinGecko /search/trending, selects top 5 available on KuCoin /USDT pairs (no strict meme filter for better selection; no fallback).
-# Fetch top trending coins
-def get_top_trending_coins():
-    # Fetch trending coins
-    trending_url = "https://api.coingecko.com/api/v3/search/trending"
+# Fetches top coins by 24h volume from KuCoin /api/v1/market/stats, filters for known meme coins, selects up to 5 with /USDT pairs.
+# No fallback—if none found, logs warning and pauses trading.
+# Known meme coins for filtering
+MEME_COINS = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'FLOKI', 'WIF', 'BRETT', 'MOG', 'CRO', 'GME'}
+
+def get_top_volume_meme_coins():
+    url = "https://api.kucoin.com/api/v1/market/stats"
     try:
-        trending_response = requests.get(trending_url)
-        trending_response.raise_for_status()
-        trending_data = trending_response.json()
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        if 'data' not in data:
+            raise Exception("Invalid response format")
     except Exception as e:
-        print(f"Error fetching trending coins: {e}")
-        logging.error(f"Trending fetch failed: {e}")
-        trade_logs.append("Trending fetch failed - no coins selected.")
+        print(f"Error fetching KuCoin market stats: {e}")
+        logging.error(f"KuCoin market stats fetch failed: {e}")
+        trade_logs.append("KuCoin market stats fetch failed - no coins selected.")
         return []
 
-    # Extract candidates
+    # Sort by 24h volume (quoteVolume) descending
     candidates = []
-    if 'coins' in trending_data:
-        for item in trending_data['coins']:
-            coin = item['item']
-            symbol = coin['symbol'].upper()
-            logging.debug(f"Trending candidate: {symbol} ({coin['id']})")
-            candidates.append({
-                'name': coin['name'],
-                'symbol': symbol,
-                'id': coin['id'],
-                'kucoin_symbol': f"{symbol}-USDT",
-                '24h_change': 0  # Trending doesn't provide 24h change, use 0
-            })
+    for item in data['data']:
+        symbol_pair = item['symbol']
+        if symbol_pair.endswith('-USDT'):
+            symbol = symbol_pair.replace('-USDT', '')
+            if symbol in MEME_COINS:
+                candidates.append({
+                    'name': symbol,  # KuCoin doesn't provide full name, use symbol
+                    'symbol': symbol,
+                    'id': symbol.lower(),  # Placeholder for consistency
+                    'kucoin_symbol': symbol_pair,
+                    '24h_change': float(item.get('changeRate', 0)) * 100  # Convert to %
+                })
+                logging.debug(f"Volume candidate: {symbol} (volume: {item['quoteVolume']}, change: {item['changeRate']})")
 
-    # Filter to those listed on KuCoin
-    exchange.load_markets()
-    selected = []
-    for cand in candidates:
-        pair = cand['kucoin_symbol']
-        if pair in exchange.markets:
-            selected.append(cand)
-            logging.info(f"Selected trending coin: {cand['symbol']} ({pair})")
-        else:
-            logging.debug(f"Skipped {cand['symbol']} - not on KuCoin as {pair}")
-
-    selected = selected[:NUM_COINS_TO_TRACK]  # Limit to 5
+    # Sort by volume and limit to 5
+    candidates.sort(key=lambda x: float(data['data'][data['data'].index({'symbol': x['kucoin_symbol']})]['quoteVolume']), reverse=True)
+    selected = candidates[:NUM_COINS_TO_TRACK]
 
     if selected:
-        log = f"Selected top {len(selected)} trending coins on KuCoin: {', '.join(c['symbol'] for c in selected)} 📈🚀"
+        log = f"Selected top {len(selected)} meme coins by volume on KuCoin: {', '.join(c['symbol'] for c in selected)} 📈🚀"
         trade_logs.append(log)
         logging.info(log)
     else:
-        log = "No trending coins available on KuCoin - no trades will occur. Check bot_logs.txt for details."
+        log = "No meme coins with high volume available on KuCoin - no trades will occur."
         trade_logs.append(log)
         logging.warning(log)
     return selected
 
-coins = get_top_trending_coins()
+coins = get_top_volume_meme_coins()
 
 # Section: Data Initialization
 # Sets up dictionaries for each selected coin's tracking data.
@@ -405,7 +401,7 @@ def dashboard(stdscr):
 
         # Prices section with manual border
         prices_start_row = 4
-        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Trending Coins on KuCoin):")
+        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Meme Coins by Volume on KuCoin):")
         row = prices_start_row + 2
         all_positive = True
         for idx, coin in enumerate(coins, 1):
