@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.2
+# Meme Coin Day Trader Bot by Grok - Version 3.7.3
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
-# Selects top 5 trending meme coins at runtime via CoinGecko /search/trending, filtered for KuCoin /USDT pairs (no fallback).
+# Selects top 5 trending coins at runtime via CoinGecko /search/trending, filtered for KuCoin /USDT pairs (loosened meme filter for better selection; no fallback).
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
-# Sells for small profits initially (0.03% above EMA); if profit >50% of invested, increases sell threshold to 0.15% for volume focus.
+# Sells for small profits initially (0.02% above EMA); if profit >50% of invested, increases sell threshold to 0.1% for volume focus.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
-# Main dashboard with borders, colors, and simple meme icons; shows live deviation.
+# Main dashboard with borders, colors, and simple meme icons; added live deviation display.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
 # KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT.
-# Changes from v3.7.1: Stricter key filtering, extended initial buy retries, verbose file logging, deviation in dashboard.
+# Changes from v3.7.2: Loosened trending filter (no strict meme check); ignored invalid keys; lowered thresholds to 0.02%; extended initial retries; verbose selection logging.
 
 import requests
 import websocket
@@ -31,15 +31,15 @@ INITIAL_BALANCE = 50.0  # Total investable, $10 per coin x 5
 INITIAL_BUY_USD = 1.0  # Initial buy-in per coin
 TRADE_AMOUNT_USD = 1.0  # Subsequent trade size
 MAX_ALLOC_PER_COIN = 10.0  # Max invested per coin
-THRESHOLD_PCT_BUY = 0.03  # Buy if below EMA by this % (lowered for more trades)
-THRESHOLD_PCT_SELL_BASE = 0.03  # Base sell threshold (lowered)
-THRESHOLD_PCT_SELL_HIGH = 0.15  # Higher threshold when profit >50% (adjusted)
+THRESHOLD_PCT_BUY = 0.02  # Buy if below EMA by this % (lowered for more trades)
+THRESHOLD_PCT_SELL_BASE = 0.02  # Base sell threshold (lowered)
+THRESHOLD_PCT_SELL_HIGH = 0.1  # Higher threshold when profit >50% (adjusted)
 PROFIT_HIGH_MARK = 0.5  # 50% profit on invested to trigger higher sell goal
 EMA_PERIOD = 60
 NUM_COINS_TO_TRACK = 5
 FEE_PCT = 0.001  # 0.1% fee per trade (KuCoin spot approx)
 PADDING = 2  # Left padding for display strings to avoid cutoff
-MAX_INITIAL_RETRIES = 10  # Retry initial buys up to 10 times
+MAX_INITIAL_RETRIES = 20  # Extended retry initial buys up to 20 times for slower data loads
 
 # Section: Global Data
 # Stores runtime data like prices, balances, logs, etc., shared across threads and functions.
@@ -64,10 +64,9 @@ deviations = {}  # For live dashboard display
 exchange = ccxt.kucoin()
 
 # Section: Coin Selection
-# Fetches trending meme coins from CoinGecko /search/trending, filters for meme category and KuCoin /USDT pairs.
-# No fallback—if none found, logs warning and pauses trading.
-# Fetch top trending meme coins
-def get_top_trending_meme_coins():
+# Fetches trending coins from CoinGecko /search/trending, selects top 5 available on KuCoin /USDT pairs (no strict meme filter for better selection; no fallback).
+# Fetch top trending coins
+def get_top_trending_coins():
     # Fetch trending coins
     trending_url = "https://api.coingecko.com/api/v3/search/trending"
     try:
@@ -80,53 +79,45 @@ def get_top_trending_meme_coins():
         trade_logs.append("Trending fetch failed - no coins selected.")
         return []
 
-    # Fetch meme coin IDs for filtering
-    meme_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=meme-token&order=market_cap_desc&per_page=100&page=1"
-    try:
-        meme_response = requests.get(meme_url)
-        meme_response.raise_for_status()
-        meme_data = meme_response.json()
-        meme_ids = set(coin['id'] for coin in meme_data)
-    except Exception as e:
-        print(f"Error fetching meme IDs: {e}")
-        logging.error(f"Meme filter fetch failed: {e}")
-        trade_logs.append("Meme filter fetch failed - no coins selected.")
-        return []
-
-    # Filter trending for memes
+    # Extract candidates
     candidates = []
     if 'coins' in trending_data:
         for item in trending_data['coins']:
             coin = item['item']
-            if coin['id'] in meme_ids:
-                symbol = coin['symbol'].upper()
-                candidates.append({
-                    'name': coin['name'],
-                    'symbol': symbol,
-                    'id': coin['id'],
-                    'kucoin_symbol': f"{symbol}-USDT",
-                    '24h_change': 0  # Trending doesn't provide 24h change, use 0
-                })
+            symbol = coin['symbol'].upper()
+            logging.debug(f"Trending candidate: {symbol} ({coin['id']})")
+            candidates.append({
+                'name': coin['name'],
+                'symbol': symbol,
+                'id': coin['id'],
+                'kucoin_symbol': f"{symbol}-USDT",
+                '24h_change': 0  # Trending doesn't provide 24h change, use 0
+            })
 
     # Filter to those listed on KuCoin
     exchange.load_markets()
     selected = []
     for cand in candidates:
         pair = cand['kucoin_symbol']
-        if pair in exchange.markets and len(selected) < NUM_COINS_TO_TRACK:
+        if pair in exchange.markets:
             selected.append(cand)
+            logging.info(f"Selected trending coin: {cand['symbol']} ({pair})")
+        else:
+            logging.debug(f"Skipped {cand['symbol']} - not on KuCoin as {pair}")
+
+    selected = selected[:NUM_COINS_TO_TRACK]  # Limit to 5
 
     if selected:
-        log = f"Selected top {len(selected)} trending meme coins on KuCoin: {', '.join(c['symbol'] for c in selected)} 📈🚀"
+        log = f"Selected top {len(selected)} trending coins on KuCoin: {', '.join(c['symbol'] for c in selected)} 📈🚀"
         trade_logs.append(log)
         logging.info(log)
     else:
-        log = "No trending meme coins available on KuCoin - no trades will occur."
+        log = "No trending coins available on KuCoin - no trades will occur. Check bot_logs.txt for details."
         trade_logs.append(log)
         logging.warning(log)
     return selected
 
-coins = get_top_trending_meme_coins()
+coins = get_top_trending_coins()
 
 # Section: Data Initialization
 # Sets up dictionaries for each selected coin's tracking data.
@@ -276,7 +267,7 @@ def initial_buys():
             execute_trade(symbol, 'buy', INITIAL_BUY_USD)
             last_trade_times[symbol] = time.time()
         else:
-            log = f"Initial buy for {symbol} failed - no price or insufficient USDT!"
+            log = f"Initial buy for {symbol} failed - no price or insufficient USDT after retries!"
             trade_logs.append(log)
             logging.warning(log)
 
@@ -414,7 +405,7 @@ def dashboard(stdscr):
 
         # Prices section with manual border
         prices_start_row = 4
-        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Trending Memes on KuCoin):")
+        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Trending Coins on KuCoin):")
         row = prices_start_row + 2
         all_positive = True
         for idx, coin in enumerate(coins, 1):
@@ -463,7 +454,7 @@ def dashboard(stdscr):
         stdscr.refresh()
 
         key = stdscr.getch()
-        if key != -1 and chr(key).lower() in ['q', 'r']:  # Filter out invalid keys
+        if key != -1 and chr(key).lower() in ['q', 'r']:  # Filter to valid keys only
             debug_logs.append(f"Key pressed: {chr(key)}")
             if key == ord('q'):
                 break
