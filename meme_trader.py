@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.1
-# Switched to KuCoin exchange for price data and simulation (better for meme coins, no location restrictions).
-# Uses hardcoded top meme coins on KuCoin (DOGE, SHIB, PEPE, BONK, FLOKI) as per request (all available as /USDT pairs).
+# Meme Coin Day Trader Bot by Grok - Version 3.7.2
+# Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
+# Selects top 5 trending meme coins at runtime via CoinGecko /search/trending, filtered for KuCoin /USDT pairs (no fallback).
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
-# Sells for small profits initially (0.05% above EMA); if profit >50% of invested, increases sell threshold to 0.25% for volume focus.
+# Sells for small profits initially (0.03% above EMA); if profit >50% of invested, increases sell threshold to 0.15% for volume focus.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
-# Main dashboard with borders, colors, and simple meme icons for fun.
-# Fully automated trading (no manual inputs except q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade); lowered thresholds.
-# KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT for real-time prices.
-# No fallback logic—hardcoded coins only.
+# Main dashboard with borders, colors, and simple meme icons; shows live deviation.
+# Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
+# KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT.
+# Changes from v3.7.1: Stricter key filtering, extended initial buy retries, verbose file logging, deviation in dashboard.
 
 import requests
 import websocket
@@ -16,6 +16,12 @@ import threading
 import time
 import curses
 import ccxt
+import logging
+
+# Section: Logging Setup
+# Configures logging to bot_logs.txt for real-time monitoring of prices, trades, and deviations.
+logging.basicConfig(filename='bot_logs.txt', level=logging.DEBUG, 
+                    format='%(asctime)s - %(message)s')
 
 # Section: Configuration
 # Defines constants for simulation parameters, trading rules, and UI settings.
@@ -25,14 +31,15 @@ INITIAL_BALANCE = 50.0  # Total investable, $10 per coin x 5
 INITIAL_BUY_USD = 1.0  # Initial buy-in per coin
 TRADE_AMOUNT_USD = 1.0  # Subsequent trade size
 MAX_ALLOC_PER_COIN = 10.0  # Max invested per coin
-THRESHOLD_PCT_BUY = 0.05  # Buy if below EMA by this % (lowered for more trades)
-THRESHOLD_PCT_SELL_BASE = 0.05  # Base sell threshold (lowered)
-THRESHOLD_PCT_SELL_HIGH = 0.25  # Higher threshold when profit >50% (adjusted)
+THRESHOLD_PCT_BUY = 0.03  # Buy if below EMA by this % (lowered for more trades)
+THRESHOLD_PCT_SELL_BASE = 0.03  # Base sell threshold (lowered)
+THRESHOLD_PCT_SELL_HIGH = 0.15  # Higher threshold when profit >50% (adjusted)
 PROFIT_HIGH_MARK = 0.5  # 50% profit on invested to trigger higher sell goal
 EMA_PERIOD = 60
 NUM_COINS_TO_TRACK = 5
 FEE_PCT = 0.001  # 0.1% fee per trade (KuCoin spot approx)
 PADDING = 2  # Left padding for display strings to avoid cutoff
+MAX_INITIAL_RETRIES = 10  # Retry initial buys up to 10 times
 
 # Section: Global Data
 # Stores runtime data like prices, balances, logs, etc., shared across threads and functions.
@@ -49,22 +56,77 @@ trade_logs = []
 total_profit = 0.0
 total_trades = 0
 debug_logs = []
+deviations = {}  # For live dashboard display
 
 # Section: Exchange Setup
-# Initializes ccxt for KuCoin to check markets and pairs (optional, but kept for consistency).
+# Initializes ccxt for KuCoin to check markets and pairs.
 # Exchange setup
 exchange = ccxt.kucoin()
 
 # Section: Coin Selection
-# Hardcoded top meme coins on KuCoin (DOGE, SHIB, PEPE, BONK, FLOKI—all confirmed available as /USDT).
-coins = [
-    {'name': 'Dogecoin', 'symbol': 'DOGE', 'id': 'dogecoin', 'kucoin_symbol': 'DOGE-USDT', '24h_change': 0},
-    {'name': 'Shiba Inu', 'symbol': 'SHIB', 'id': 'shiba-inu', 'kucoin_symbol': 'SHIB-USDT', '24h_change': 0},
-    {'name': 'Pepe', 'symbol': 'PEPE', 'id': 'pepe', 'kucoin_symbol': 'PEPE-USDT', '24h_change': 0},
-    {'name': 'Bonk', 'symbol': 'BONK', 'id': 'bonk', 'kucoin_symbol': 'BONK-USDT', '24h_change': 0},
-    {'name': 'Floki Inu', 'symbol': 'FLOKI', 'id': 'floki-inu', 'kucoin_symbol': 'FLOKI-USDT', '24h_change': 0}
-]
-trade_logs.append(f"Using top meme coins on KuCoin: {', '.join(c['symbol'] for c in coins)} 🚀")
+# Fetches trending meme coins from CoinGecko /search/trending, filters for meme category and KuCoin /USDT pairs.
+# No fallback—if none found, logs warning and pauses trading.
+# Fetch top trending meme coins
+def get_top_trending_meme_coins():
+    # Fetch trending coins
+    trending_url = "https://api.coingecko.com/api/v3/search/trending"
+    try:
+        trending_response = requests.get(trending_url)
+        trending_response.raise_for_status()
+        trending_data = trending_response.json()
+    except Exception as e:
+        print(f"Error fetching trending coins: {e}")
+        logging.error(f"Trending fetch failed: {e}")
+        trade_logs.append("Trending fetch failed - no coins selected.")
+        return []
+
+    # Fetch meme coin IDs for filtering
+    meme_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=meme-token&order=market_cap_desc&per_page=100&page=1"
+    try:
+        meme_response = requests.get(meme_url)
+        meme_response.raise_for_status()
+        meme_data = meme_response.json()
+        meme_ids = set(coin['id'] for coin in meme_data)
+    except Exception as e:
+        print(f"Error fetching meme IDs: {e}")
+        logging.error(f"Meme filter fetch failed: {e}")
+        trade_logs.append("Meme filter fetch failed - no coins selected.")
+        return []
+
+    # Filter trending for memes
+    candidates = []
+    if 'coins' in trending_data:
+        for item in trending_data['coins']:
+            coin = item['item']
+            if coin['id'] in meme_ids:
+                symbol = coin['symbol'].upper()
+                candidates.append({
+                    'name': coin['name'],
+                    'symbol': symbol,
+                    'id': coin['id'],
+                    'kucoin_symbol': f"{symbol}-USDT",
+                    '24h_change': 0  # Trending doesn't provide 24h change, use 0
+                })
+
+    # Filter to those listed on KuCoin
+    exchange.load_markets()
+    selected = []
+    for cand in candidates:
+        pair = cand['kucoin_symbol']
+        if pair in exchange.markets and len(selected) < NUM_COINS_TO_TRACK:
+            selected.append(cand)
+
+    if selected:
+        log = f"Selected top {len(selected)} trending meme coins on KuCoin: {', '.join(c['symbol'] for c in selected)} 📈🚀"
+        trade_logs.append(log)
+        logging.info(log)
+    else:
+        log = "No trending meme coins available on KuCoin - no trades will occur."
+        trade_logs.append(log)
+        logging.warning(log)
+    return selected
+
+coins = get_top_trending_meme_coins()
 
 # Section: Data Initialization
 # Sets up dictionaries for each selected coin's tracking data.
@@ -79,6 +141,7 @@ for coin in coins:
     balances[symbol] = 0.0
     invested[symbol] = 0.0
     coin_profits[symbol] = 0.0
+    deviations[symbol] = 0.0
 
 # Section: KuCoin WebSocket Setup
 # Fetches public token from KuCoin API, then connects to WebSocket for real-time tickers.
@@ -115,15 +178,21 @@ def on_message(ws, message):
             if len(price_histories[symbol]) > EMA_PERIOD:
                 price_histories[symbol].pop(0)
             emas[symbol] = sum(price_histories[symbol]) / len(price_histories[symbol]) if price_histories[symbol] else price
+            deviations[symbol] = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
+            logging.debug(f"{symbol} price: ${price:.10f}, EMA: ${emas[symbol]:.10f}, deviation: {deviations[symbol]:.2f}%")
 
 def on_error(ws, error):
     print(f"WebSocket error: {error}")
+    logging.error(f"WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed")
+    logging.info("WebSocket closed")
 
 def on_open(ws):
-    debug_logs.append("WebSocket opened - subscribing to tickers...")
+    log = "WebSocket opened - subscribing to tickers..."
+    debug_logs.append(log)
+    logging.info(log)
     subs = {
         "type": "subscribe",
         "topic": f"/market/ticker:{','.join(coin['kucoin_symbol'] for coin in coins)}",
@@ -153,6 +222,7 @@ def execute_trade(symbol, side, amount_usd):
     if price == 0.0:
         log = f"Cannot {side} {symbol} - price not loaded yet!"
         debug_logs.append(log)
+        logging.warning(log)
         return
     quantity = amount_usd / price
     fee = amount_usd * FEE_PCT
@@ -161,16 +231,19 @@ def execute_trade(symbol, side, amount_usd):
         if invested[symbol] + amount_usd > MAX_ALLOC_PER_COIN or balances['USDT'] < amount_usd + fee:
             log = f"Cannot buy more {symbol} - allocation cap reached or insufficient USDT!"
             debug_logs.append(log)
+            logging.warning(log)
             return
         balances['USDT'] -= (amount_usd + fee)
         balances[symbol] += quantity
         invested[symbol] += amount_usd
         log = f"Bought {quantity:.4f} {symbol} for ${amount_usd:.2f} (fee ${fee:.2f})! HODL! 💪"
-        debug_logs.append(f"Buy executed for {symbol}")
+        debug_logs.append(log)
+        logging.info(log)
     elif side == 'sell':
         if balances[symbol] < quantity:
             log = f"Not enough {symbol} to sell!"
             debug_logs.append(log)
+            logging.warning(log)
             return
         balances['USDT'] += (amount_usd - fee)
         balances[symbol] -= quantity
@@ -178,7 +251,8 @@ def execute_trade(symbol, side, amount_usd):
         coin_profits[symbol] += profit
         total_profit += profit
         log = f"Sold {quantity:.4f} {symbol} for ${amount_usd:.2f} (fee ${fee:.2f})! Profit: ${profit:.2f} 🤑"
-        debug_logs.append(f"Sell executed for {symbol}")
+        debug_logs.append(log)
+        logging.info(log)
     else:
         return
 
@@ -188,17 +262,27 @@ def execute_trade(symbol, side, amount_usd):
         trade_logs.pop(0)
 
 # Section: Initial Buys
-# Performs initial $1 buy for each selected coin after data loads.
+# Performs initial $1 buy for each selected coin after data loads, retries if price not loaded.
 # Initial buys
 def initial_buys():
     for coin in coins:
         symbol = coin['symbol']
+        retry_count = 0
+        while retry_count < MAX_INITIAL_RETRIES and prices[symbol] == 0.0:
+            logging.debug(f"Waiting for {symbol} price data... retry {retry_count + 1}")
+            time.sleep(2)
+            retry_count += 1
         if prices[symbol] > 0 and balances['USDT'] >= INITIAL_BUY_USD:
             execute_trade(symbol, 'buy', INITIAL_BUY_USD)
             last_trade_times[symbol] = time.time()
-            time.sleep(1)
+        else:
+            log = f"Initial buy for {symbol} failed - no price or insufficient USDT!"
+            trade_logs.append(log)
+            logging.warning(log)
 
-initial_buys()
+initial_thread = threading.Thread(target=initial_buys)
+initial_thread.daemon = True
+initial_thread.start()
 
 # Section: Reset Simulation
 # Resets all balances, profits, and logs; re-runs initial buys.
@@ -216,7 +300,9 @@ def reset_simulation():
     total_trades = 0
     trade_logs = []
     initial_buys()
-    trade_logs.append("Simulation reset! Fresh start. 🔄")
+    log = "Simulation reset! Fresh start. 🔄"
+    trade_logs.append(log)
+    logging.info(log)
 
 # Section: Trading Loop
 # Background thread for automated trades: buys if low (under cap), sells based on dynamic threshold; logs deviations for debug.
@@ -232,7 +318,8 @@ def trading_loop():
                 continue
 
             deviation = (price - ema) / ema * 100
-            debug_logs.append(f"{symbol} deviation: {deviation:.2f}%")
+            deviations[symbol] = deviation
+            logging.debug(f"{symbol} deviation: {deviation:.2f}%")
             # Buy if low and under allocation
             if deviation <= -THRESHOLD_PCT_BUY and invested[symbol] < MAX_ALLOC_PER_COIN and balances['USDT'] >= TRADE_AMOUNT_USD:
                 execute_trade(symbol, 'buy', TRADE_AMOUNT_USD)
@@ -255,7 +342,7 @@ trade_thread.start()
 def title_screen(stdscr):
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, -1)  # Title color (changed from yellow)
+    curses.init_pair(1, curses.COLOR_GREEN, -1)  # Title color
     curses.init_pair(2, curses.COLOR_CYAN, -1)    # Border/ASCII color
 
     height, width = stdscr.getmaxyx()
@@ -298,7 +385,7 @@ def title_screen(stdscr):
     stdscr.getch()  # Wait for key press
 
 # Section: Dashboard
-# Main UI loop: Displays prices, trades, handles key inputs for quit/reset only (fully auto trading).
+# Main UI loop: Displays prices, trades, deviations, handles key inputs for quit/reset only.
 # Dashboard with borders and flair
 def dashboard(stdscr):
     curses.curs_set(0)
@@ -327,13 +414,14 @@ def dashboard(stdscr):
 
         # Prices section with manual border
         prices_start_row = 4
-        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Meme Coins on KuCoin):")
+        stdscr.addstr(prices_start_row, PADDING, "Live Prices (Top Trending Memes on KuCoin):")
         row = prices_start_row + 2
         all_positive = True
         for idx, coin in enumerate(coins, 1):
             symbol = coin['symbol']
             price = prices.get(symbol, 0.0)
             change = changes.get(symbol, 0.0)
+            dev = deviations.get(symbol, 0.0)
             if change < 0:
                 all_positive = False
             color = 1 if change > 0 else (2 if change < 0 else 5)
@@ -341,7 +429,7 @@ def dashboard(stdscr):
             bal = balances.get(symbol, 0.0)
             inv = invested.get(symbol, 0.0)
             prof = coin_profits.get(symbol, 0.0)
-            display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Bal: {bal:.4f} | Inv: ${inv:.2f}/10 | Prof: ${prof:.2f} | 24h: {coin['24h_change']:+.2f}%"
+            display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Dev: {dev:+.2f}% | Bal: {bal:.4f} | Inv: ${inv:.2f}/10 | Prof: ${prof:.2f}"
             stdscr.addstr(row, PADDING, display_str[:width-1 - PADDING], curses.color_pair(color))
             row += 1
 
@@ -375,12 +463,12 @@ def dashboard(stdscr):
         stdscr.refresh()
 
         key = stdscr.getch()
-        if key != -1:
+        if key != -1 and chr(key).lower() in ['q', 'r']:  # Filter out invalid keys
             debug_logs.append(f"Key pressed: {chr(key)}")
-        if key == ord('q'):
-            break
-        elif key == ord('r'):
-            reset_simulation()
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                reset_simulation()
 
 # Section: Main Entry
 # Runs title screen then dashboard via curses wrapper.
@@ -395,4 +483,3 @@ print("\nDebug Logs:")
 for dlog in debug_logs:
     print(dlog)
 print(f"Bot exited. Total trades: {total_trades}, Profit: ${total_profit:.2f}. Fun sim – trade responsibly!")
-        
