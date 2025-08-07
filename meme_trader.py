@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.5
+# Meme Coin Day Trader Bot by Grok - Version 3.7.6
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
 # Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
-# Sells for small profits initially (0.01% above EMA); if profit >50% of invested, increases sell threshold to 0.05% for volume focus.
+# Sells for small profits initially (0.005% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
 # Main dashboard with borders, colors, and simple meme icons; shows live deviation.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
 # KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT, with reconnection.
-# Changes from v3.7.4: Fixed endpoint to /api/v1/market/allTickers; lowered thresholds to 0.01%; added API retry logic; verbose logging.
+# Changes from v3.7.5: Fix trading loop crash; lower thresholds to 0.005%; EMA period 30; rounding tolerance; cooldown logging; ping/pong.
 
 import requests
 import websocket
@@ -31,18 +31,20 @@ INITIAL_BALANCE = 50.0  # Total investable, $10 per coin x 5
 INITIAL_BUY_USD = 1.0  # Initial buy-in per coin
 TRADE_AMOUNT_USD = 1.0  # Subsequent trade size
 MAX_ALLOC_PER_COIN = 10.0  # Max invested per coin
-THRESHOLD_PCT_BUY = 0.01  # Buy if below EMA by this % (lowered for more trades)
-THRESHOLD_PCT_SELL_BASE = 0.01  # Base sell threshold (lowered)
-THRESHOLD_PCT_SELL_HIGH = 0.05  # Higher threshold when profit >50% (adjusted)
+THRESHOLD_PCT_BUY = 0.005  # Buy if below EMA by this % (lowered)
+THRESHOLD_PCT_SELL_BASE = 0.005  # Base sell threshold (lowered)
+THRESHOLD_PCT_SELL_HIGH = 0.025  # Higher threshold when profit >50%
 PROFIT_HIGH_MARK = 0.5  # 50% profit on invested to trigger higher sell goal
-EMA_PERIOD = 60
+EMA_PERIOD = 30  # Shortened for faster response
 NUM_COINS_TO_TRACK = 5
 FEE_PCT = 0.001  # 0.1% fee per trade (KuCoin spot approx)
 PADDING = 2  # Left padding for display strings to avoid cutoff
-MAX_INITIAL_RETRIES = 20  # Retry initial buys up to 20 times for slower data loads
+MAX_INITIAL_RETRIES = 20  # Retry initial buys up to 20 times
 WEBSOCKET_RECONNECT_DELAY = 5  # Seconds to wait before reconnecting WebSocket
 API_RETRY_ATTEMPTS = 3  # Retry API calls on failure
 API_RETRY_DELAY = 2  # Seconds between retries
+COOLDOWN_SEC = 5  # Cooldown period per coin
+THRESHOLD_TOLERANCE = 0.0001  # Tolerance for floating-point comparisons
 
 # Section: Global Data
 # Stores runtime data like prices, balances, logs, etc., shared across threads and functions.
@@ -168,25 +170,30 @@ def get_kucoin_token():
 # Callbacks for real-time price updates from KuCoin via WebSocket.
 # WebSocket callbacks
 def on_message(ws, message):
-    data = json.loads(message)
-    if 'topic' in data and 'data' in data and data['topic'].startswith('/market/ticker:'):
-        payload = data['data']
-        symbol_pair = data['topic'].split(':')[1]
-        symbol = symbol_pair.replace('-USDT', '')
-        price = float(payload['price'])
-        change = 0.0
-        if symbol in prices and prices[symbol] > 0:
-            change = (price - prices[symbol]) / prices[symbol] * 100
-        prices[symbol] = price
-        changes[symbol] = change
+    try:
+        data = json.loads(message)
+        if 'topic' in data and 'data' in data and data['topic'].startswith('/market/ticker:'):
+            payload = data['data']
+            symbol_pair = data['topic'].split(':')[1]
+            symbol = symbol_pair.replace('-USDT', '')
+            price = float(payload['price'])
+            change = 0.0
+            if symbol in prices and prices[symbol] > 0:
+                change = (price - prices[symbol]) / prices[symbol] * 100
+            prices[symbol] = price
+            changes[symbol] = change
 
-        if symbol in price_histories:
-            price_histories[symbol].append(price)
-            if len(price_histories[symbol]) > EMA_PERIOD:
-                price_histories[symbol].pop(0)
-            emas[symbol] = sum(price_histories[symbol]) / len(price_histories[symbol]) if price_histories[symbol] else price
-            deviations[symbol] = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
-            logging.debug(f"{symbol} price: ${price:.10f}, EMA: ${emas[symbol]:.10f}, deviation: {deviations[symbol]:.2f}%")
+            if symbol in price_histories:
+                price_histories[symbol].append(price)
+                if len(price_histories[symbol]) > EMA_PERIOD:
+                    price_histories[symbol].pop(0)
+                emas[symbol] = sum(price_histories[symbol]) / len(price_histories[symbol]) if price_histories[symbol] else price
+                deviations[symbol] = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
+                logging.debug(f"{symbol} price: ${price:.10f}, EMA: ${emas[symbol]:.10f}, deviation: {deviations[symbol]:.2f}%")
+        # Send ping to keep connection alive
+        ws.send(json.dumps({"type": "ping"}))
+    except Exception as e:
+        logging.error(f"WebSocket message processing error: {e}")
 
 def on_error(ws, error):
     print(f"WebSocket error: {error}")
@@ -321,28 +328,36 @@ def reset_simulation():
 # Trading loop
 def trading_loop():
     while True:
-        current_time = time.time()
-        for coin in coins:
-            symbol = coin['symbol']
-            price = prices.get(symbol, 0.0)
-            ema = emas.get(symbol, 0.0)
-            if price == 0.0 or ema == 0.0 or current_time - last_trade_times.get(symbol, 0) < COOLDOWN_SEC:
-                continue
+        try:
+            current_time = time.time()
+            for coin in coins:
+                symbol = coin['symbol']
+                price = prices.get(symbol, 0.0)
+                ema = emas.get(symbol, 0.0)
+                if price == 0.0 or ema == 0.0:
+                    logging.debug(f"Skipping {symbol} - price or EMA not ready")
+                    continue
+                if current_time - last_trade_times.get(symbol, 0) < COOLDOWN_SEC:
+                    logging.debug(f"Skipping {symbol} - in cooldown (last trade: {last_trade_times[symbol]})")
+                    continue
 
-            deviation = (price - ema) / ema * 100
-            deviations[symbol] = deviation
-            logging.debug(f"{symbol} deviation: {deviation:.2f}%")
-            # Buy if low and under allocation
-            if deviation <= -THRESHOLD_PCT_BUY and invested[symbol] < MAX_ALLOC_PER_COIN and balances['USDT'] >= TRADE_AMOUNT_USD:
-                execute_trade(symbol, 'buy', TRADE_AMOUNT_USD)
-                last_trade_times[symbol] = current_time
-            # Sell: Adjust threshold based on profit
-            sell_threshold = THRESHOLD_PCT_SELL_HIGH if invested[symbol] > 0 and coin_profits[symbol] > invested[symbol] * PROFIT_HIGH_MARK else THRESHOLD_PCT_SELL_BASE
-            if deviation >= sell_threshold and balances[symbol] > (TRADE_AMOUNT_USD / price):
-                execute_trade(symbol, 'sell', TRADE_AMOUNT_USD)
-                last_trade_times[symbol] = current_time
+                deviation = (price - ema) / ema * 100 if ema > 0 else 0.0
+                deviations[symbol] = deviation
+                logging.debug(f"{symbol} deviation: {deviation:.2f}%")
+                # Buy if low and under allocation
+                if deviation <= -THRESHOLD_PCT_BUY + THRESHOLD_TOLERANCE and invested[symbol] < MAX_ALLOC_PER_COIN and balances['USDT'] >= TRADE_AMOUNT_USD:
+                    execute_trade(symbol, 'buy', TRADE_AMOUNT_USD)
+                    last_trade_times[symbol] = current_time
+                # Sell: Adjust threshold based on profit
+                sell_threshold = THRESHOLD_PCT_SELL_HIGH if invested[symbol] > 0 and coin_profits[symbol] > invested[symbol] * PROFIT_HIGH_MARK else THRESHOLD_PCT_SELL_BASE
+                if deviation >= sell_threshold - THRESHOLD_TOLERANCE and balances[symbol] > (TRADE_AMOUNT_USD / price):
+                    execute_trade(symbol, 'sell', TRADE_AMOUNT_USD)
+                    last_trade_times[symbol] = current_time
 
-        time.sleep(1)
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"Trading loop error: {e}")
+            time.sleep(1)  # Prevent tight loop on crash
 
 trade_thread = threading.Thread(target=trading_loop)
 trade_thread.daemon = True
