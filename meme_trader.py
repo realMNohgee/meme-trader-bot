@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.0
+# Meme Coin Day Trader Bot by Grok - Version 3.7.1
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
 # Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
-# Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
+# Allocates $1 per trade, no cap on total investment per coin to allow thousands of trades/hour.
 # Sells for small profits initially (0.001% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
 # Main dashboard with borders, colors, and simple meme icons; shows live deviation and total value.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
-# KuCoin WebSocket: Fetches public token, connects to dynamic endpoint, subscribes to /market/ticker:SYMBOL-USDT without confirmation, with dynamic ping.
-# Changes from v3.6.9: Removed subscription confirmation, removed "response": True, used dynamic endpoint/ping from token response, lowered thresholds to 0.001%, added pong logging.
+# KuCoin WebSocket: Fetches public token, connects to dynamic endpoint, subscribes to /market/ticker:SYMBOL-USDT individually with delays, with CCXT fallback.
+# Changes from v3.7.0: Individual ticker subscriptions with delays, removed MAX_ALLOC_PER_COIN, added CCXT price fallback, added reconnect logging.
 import requests
 import websocket
 import json
@@ -26,7 +26,6 @@ SIMULATION_MODE = True
 INITIAL_BALANCE = 50.0
 INITIAL_BUY_USD = 1.0
 TRADE_AMOUNT_USD = 1.0
-MAX_ALLOC_PER_COIN = 10.0
 THRESHOLD_PCT_BUY = 0.001  # Buy if below EMA by 0.001%
 THRESHOLD_PCT_SELL_BASE = 0.001  # Sell if above EMA by 0.001%
 THRESHOLD_PCT_SELL_HIGH = 0.025
@@ -138,10 +137,9 @@ def get_kucoin_token():
             if 'data' in data and 'token' in data['data'] and 'instanceServers' in data['data']:
                 token = data['data']['token']
                 endpoint = data['data']['instanceServers'][0]['endpoint']
-                ping_interval = data['data']['instanceServers'][0]['pingInterval'] // 1000 - 5  # Subtract 5s for safety
-                ping_timeout = data['data']['instanceServers'][0]['pingTimeout'] // 1000
-                logging.info(f"Successfully fetched KuCoin token: {token[:10]}..., endpoint: {endpoint}, ping_interval: {ping_interval}s, ping_timeout: {ping_timeout}s")
-                return token, endpoint, ping_interval, ping_timeout
+                ping_interval = 15  # KuCoin recommends 18s, use 15s for safety
+                logging.info(f"Successfully fetched KuCoin token: {token[:10]}..., endpoint: {endpoint}, ping_interval: {ping_interval}s")
+                return token, endpoint, ping_interval
             else:
                 raise Exception("Invalid response format")
         except Exception as e:
@@ -151,7 +149,27 @@ def get_kucoin_token():
                 time.sleep(API_RETRY_DELAY)
             else:
                 raise Exception("Failed to fetch KuCoin public token after retries")
-    return None, None, None, None
+    return None, None, None
+
+# Section: Fallback Price Fetch
+def fetch_fallback_prices():
+    while True:
+        for coin in coins:
+            symbol = coin['symbol']
+            symbol_pair = coin['kucoin_symbol']
+            if prices.get(symbol, 0.0) == 0.0:
+                try:
+                    ticker = exchange.fetch_ticker(symbol_pair)
+                    price = float(ticker['last'])
+                    prices[symbol] = price
+                    logging.debug(f"Fetched fallback price for {symbol}: ${price:.10f}")
+                except Exception as e:
+                    logging.error(f"Failed to fetch fallback price for {symbol_pair}: {e}")
+        time.sleep(60)  # Fetch every minute
+
+fallback_thread = threading.Thread(target=fetch_fallback_prices)
+fallback_thread.daemon = True
+fallback_thread.start()
 
 # Section: WebSocket Handling
 def on_message(ws, message):
@@ -184,7 +202,7 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed")
-    logging.info("WebSocket closed - reconnecting...")
+    logging.info(f"WebSocket closed (code: {close_status_code}, msg: {close_msg}) - reconnecting...")
     time.sleep(WEBSOCKET_RECONNECT_DELAY)
     run_ws()
 
@@ -192,21 +210,23 @@ def on_open(ws):
     log = "WebSocket opened - subscribing to tickers..."
     debug_logs.append(log)
     logging.info(log)
-    subs = {
-        "type": "subscribe",
-        "topic": f"/market/ticker:{','.join(coin['kucoin_symbol'] for c in coins)}"
-    }
-    ws.send(json.dumps(subs))
-    logging.debug(f"Subscribed to {subs['topic']}")
+    for coin in coins:
+        subs = {
+            "type": "subscribe",
+            "topic": f"/market/ticker:{coin['kucoin_symbol']}"
+        }
+        ws.send(json.dumps(subs))
+        logging.debug(f"Subscribed to {coin['kucoin_symbol']}")
+        time.sleep(1)  # Delay to avoid KuCoin limits
 
 # Section: WebSocket Runner
 def run_ws():
     global ws
-    token, endpoint, ping_interval, ping_timeout = get_kucoin_token()
+    token, endpoint, ping_interval = get_kucoin_token()
     ws_url = f"{endpoint}?token={token}"
     ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     while True:
-        ws.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout)
+        ws.run_forever(ping_interval=ping_interval)
         logging.info("WebSocket closed - reconnecting...")
         time.sleep(WEBSOCKET_RECONNECT_DELAY)
 
@@ -227,8 +247,8 @@ def execute_trade(symbol, side, amount_usd):
     quantity = amount_usd / price
     fee = amount_usd * FEE_PCT
     if side == 'buy':
-        if invested[symbol] + amount_usd > MAX_ALLOC_PER_COIN or balances['USDT'] < amount_usd + fee:
-            log = f"Cannot buy more {symbol} - allocation cap reached or insufficient USDT!"
+        if balances['USDT'] < amount_usd + fee:
+            log = f"Cannot buy more {symbol} - insufficient USDT!"
             debug_logs.append(log)
             logging.warning(log)
             return
@@ -312,14 +332,14 @@ def trading_loop():
             deviation = (price - ema) / ema * 100 if ema > 0 else 0.0
             deviations[symbol] = deviation
             logging.debug(f"{symbol} deviation: {deviation:.2f}%")
-            if deviation <= -THRESHOLD_PCT_BUY + THRESHOLD_TOLERANCE and invested[symbol] < MAX_ALLOC_PER_COIN and balances['USDT'] >= TRADE_AMOUNT_USD:
+            if deviation <= -THRESHOLD_PCT_BUY + THRESHOLD_TOLERANCE and balances['USDT'] >= TRADE_AMOUNT_USD:
                 execute_trade(symbol, 'buy', TRADE_AMOUNT_USD)
                 last_trade_times[symbol] = current_time
             sell_threshold = THRESHOLD_PCT_SELL_HIGH if invested[symbol] > 0 and coin_profits[symbol] > invested[symbol] * PROFIT_HIGH_MARK else THRESHOLD_PCT_SELL_BASE
             if deviation >= sell_threshold - THRESHOLD_TOLERANCE and balances[symbol] > (TRADE_AMOUNT_USD / price):
                 execute_trade(symbol, 'sell', TRADE_AMOUNT_USD)
                 last_trade_times[symbol] = current_time
-        time.sleep(1)
+        time.sleep(0.1)  # Faster loop for high trade volume
 trade_thread = threading.Thread(target=trading_loop)
 trade_thread.daemon = True
 trade_thread.start()
@@ -398,7 +418,7 @@ def dashboard(stdscr):
             inv = invested.get(symbol, 0.0)
             prof = coin_profits.get(symbol, 0.0)
             total_value += bal * price if price > 0 else bal * emas[symbol] if emas[symbol] > 0 else 0.0
-            display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Dev: {dev:+.2f}% | Bal: {bal:.4f} | Inv: ${inv:.2f}/10 | Prof: ${prof:.2f}"
+            display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Dev: {dev:+.2f}% | Bal: {bal:.4f} | Inv: ${inv:.2f} | Prof: ${prof:.2f}"
             stdscr.addstr(row, PADDING, display_str[:width-1 - PADDING], curses.color_pair(color))
             row += 1
         stdscr.hline(prices_start_row - 1, 0, curses.ACS_HLINE, width)
