@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.6.7
+# Meme Coin Day Trader Bot by Grok - Version 3.7.0
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
 # Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
 # Allocates up to $10 per coin (starts with $1 buy, then $1 increments if low, caps at $10 invested).
-# Sells for small profits initially (0.03% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
+# Sells for small profits initially (0.001% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
-# Main dashboard with borders, colors, and simple meme icons; shows live deviation.
+# Main dashboard with borders, colors, and simple meme icons; shows live deviation and total value.
 # Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
-# KuCoin WebSocket: Fetches public token, connects to wss://ws-api.kucoin.com, subscribes to /market/ticker:SYMBOL-USDT, with reconnection and pings.
-# Changes from v3.6.6: Added WebSocket ping_interval, re-subscribe on reconnect, fixed fee display, adjusted thresholds.
+# KuCoin WebSocket: Fetches public token, connects to dynamic endpoint, subscribes to /market/ticker:SYMBOL-USDT without confirmation, with dynamic ping.
+# Changes from v3.6.9: Removed subscription confirmation, removed "response": True, used dynamic endpoint/ping from token response, lowered thresholds to 0.001%, added pong logging.
 import requests
 import websocket
 import json
@@ -27,8 +27,8 @@ INITIAL_BALANCE = 50.0
 INITIAL_BUY_USD = 1.0
 TRADE_AMOUNT_USD = 1.0
 MAX_ALLOC_PER_COIN = 10.0
-THRESHOLD_PCT_BUY = 0.03  # Buy if below EMA by 0.03%
-THRESHOLD_PCT_SELL_BASE = 0.03  # Sell if above EMA by 0.03%
+THRESHOLD_PCT_BUY = 0.001  # Buy if below EMA by 0.001%
+THRESHOLD_PCT_SELL_BASE = 0.001  # Sell if above EMA by 0.001%
 THRESHOLD_PCT_SELL_HIGH = 0.025
 PROFIT_HIGH_MARK = 0.5
 EMA_PERIOD = 30
@@ -41,6 +41,7 @@ API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2
 COOLDOWN_SEC = 5
 THRESHOLD_TOLERANCE = 0.0001
+TOKEN_RETRY_ATTEMPTS = 3
 
 # Section: Global Data
 prices = {}
@@ -129,28 +130,35 @@ for coin in coins:
 # Section: KuCoin WebSocket Setup
 def get_kucoin_token():
     url = "https://api.kucoin.com/api/v1/bullet-public"
-    for attempt in range(API_RETRY_ATTEMPTS):
+    for attempt in range(TOKEN_RETRY_ATTEMPTS):
         try:
             response = requests.post(url)
             response.raise_for_status()
             data = response.json()
-            if 'data' in data and 'token' in data['data']:
-                return data['data']['token']
+            if 'data' in data and 'token' in data['data'] and 'instanceServers' in data['data']:
+                token = data['data']['token']
+                endpoint = data['data']['instanceServers'][0]['endpoint']
+                ping_interval = data['data']['instanceServers'][0]['pingInterval'] // 1000 - 5  # Subtract 5s for safety
+                ping_timeout = data['data']['instanceServers'][0]['pingTimeout'] // 1000
+                logging.info(f"Successfully fetched KuCoin token: {token[:10]}..., endpoint: {endpoint}, ping_interval: {ping_interval}s, ping_timeout: {ping_timeout}s")
+                return token, endpoint, ping_interval, ping_timeout
             else:
                 raise Exception("Invalid response format")
         except Exception as e:
             print(f"Error fetching KuCoin token (attempt {attempt + 1}): {e}")
             logging.error(f"KuCoin token fetch failed (attempt {attempt + 1}): {e}")
-            if attempt < API_RETRY_ATTEMPTS - 1:
+            if attempt < TOKEN_RETRY_ATTEMPTS - 1:
                 time.sleep(API_RETRY_DELAY)
             else:
                 raise Exception("Failed to fetch KuCoin public token after retries")
-    return None
+    return None, None, None, None
 
 # Section: WebSocket Handling
 def on_message(ws, message):
     logging.debug(f"Raw WebSocket message: {message}")
     data = json.loads(message)
+    if 'type' in data and data['type'] == 'pong':
+        logging.debug("Received WebSocket pong")
     if 'topic' in data and 'data' in data and data['topic'].startswith('/market/ticker:'):
         payload = data['data']
         symbol_pair = data['topic'].split(':')[1]
@@ -168,6 +176,7 @@ def on_message(ws, message):
             emas[symbol] = sum(price_histories[symbol]) / len(price_histories[symbol]) if price_histories[symbol] else price
             deviations[symbol] = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
             logging.debug(f"{symbol} price: ${price:.10f}, EMA: ${emas[symbol]:.10f}, deviation: {deviations[symbol]:.2f}%")
+            logging.debug(f"Balance {symbol}: {balances[symbol]:.4f}, USDT: {balances['USDT']:.2f}")
 
 def on_error(ws, error):
     print(f"WebSocket error: {error}")
@@ -183,24 +192,21 @@ def on_open(ws):
     log = "WebSocket opened - subscribing to tickers..."
     debug_logs.append(log)
     logging.info(log)
-    # Subscribe to all tickers individually to ensure delivery
-    for coin in coins:
-        subs = {
-            "type": "subscribe",
-            "topic": f"/market/ticker:{coin['kucoin_symbol']}",
-            "response": True
-        }
-        ws.send(json.dumps(subs))
-        logging.debug(f"Subscribed to {coin['kucoin_symbol']}")
+    subs = {
+        "type": "subscribe",
+        "topic": f"/market/ticker:{','.join(coin['kucoin_symbol'] for c in coins)}"
+    }
+    ws.send(json.dumps(subs))
+    logging.debug(f"Subscribed to {subs['topic']}")
 
 # Section: WebSocket Runner
 def run_ws():
     global ws
-    token = get_kucoin_token()
-    ws_url = f"wss://ws-api.kucoin.com/endpoint?token={token}"
+    token, endpoint, ping_interval, ping_timeout = get_kucoin_token()
+    ws_url = f"{endpoint}?token={token}"
     ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     while True:
-        ws.run_forever(ping_interval=10)  # Ping every 10s
+        ws.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout)
         logging.info("WebSocket closed - reconnecting...")
         time.sleep(WEBSOCKET_RECONNECT_DELAY)
 
@@ -391,7 +397,7 @@ def dashboard(stdscr):
             bal = balances.get(symbol, 0.0)
             inv = invested.get(symbol, 0.0)
             prof = coin_profits.get(symbol, 0.0)
-            total_value += bal * price if price > 0 else 0.0
+            total_value += bal * price if price > 0 else bal * emas[symbol] if emas[symbol] > 0 else 0.0
             display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Dev: {dev:+.2f}% | Bal: {bal:.4f} | Inv: ${inv:.2f}/10 | Prof: ${prof:.2f}"
             stdscr.addstr(row, PADDING, display_str[:width-1 - PADDING], curses.color_pair(color))
             row += 1
