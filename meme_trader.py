@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.1
+# Meme Coin Day Trader Bot by Grok - Version 3.7.2
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
 # Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
 # Allocates $1 per trade, no cap on total investment per coin to allow thousands of trades/hour.
 # Sells for small profits initially (0.001% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
 # Main dashboard with borders, colors, and simple meme icons; shows live deviation and total value.
-# Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.1% per trade).
+# Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.05% per trade).
 # KuCoin WebSocket: Fetches public token, connects to dynamic endpoint, subscribes to /market/ticker:SYMBOL-USDT individually with delays, with CCXT fallback.
-# Changes from v3.7.0: Individual ticker subscriptions with delays, removed MAX_ALLOC_PER_COIN, added CCXT price fallback, added reconnect logging.
+# Changes from v3.7.1: Fixed total_value calculation, reduced FEE_PCT to 0.0005, added WebSocket reconnect cap, kept thresholds at 0.001%.
 import requests
 import websocket
 import json
@@ -32,10 +32,11 @@ THRESHOLD_PCT_SELL_HIGH = 0.025
 PROFIT_HIGH_MARK = 0.5
 EMA_PERIOD = 30
 NUM_COINS_TO_TRACK = 5
-FEE_PCT = 0.001  # 0.1% fee per trade
+FEE_PCT = 0.0005  # 0.05% fee per trade
 PADDING = 2
 MAX_INITIAL_RETRIES = 20
 WEBSOCKET_RECONNECT_DELAY = 5
+WEBSOCKET_MAX_RECONNECTS = 10
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2
 COOLDOWN_SEC = 5
@@ -57,6 +58,7 @@ total_trades = 0
 debug_logs = []
 deviations = {}
 ws = None
+reconnect_attempts = 0
 
 # Section: Exchange Setup
 exchange = ccxt.kucoin()
@@ -201,12 +203,19 @@ def on_error(ws, error):
     logging.error(f"WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
+    global reconnect_attempts
     print("WebSocket closed")
     logging.info(f"WebSocket closed (code: {close_status_code}, msg: {close_msg}) - reconnecting...")
+    reconnect_attempts += 1
+    if reconnect_attempts >= WEBSOCKET_MAX_RECONNECTS:
+        logging.error("Max WebSocket reconnect attempts reached, stopping...")
+        return
     time.sleep(WEBSOCKET_RECONNECT_DELAY)
     run_ws()
 
 def on_open(ws):
+    global reconnect_attempts
+    reconnect_attempts = 0
     log = "WebSocket opened - subscribing to tickers..."
     debug_logs.append(log)
     logging.info(log)
@@ -225,10 +234,7 @@ def run_ws():
     token, endpoint, ping_interval = get_kucoin_token()
     ws_url = f"{endpoint}?token={token}"
     ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
-    while True:
-        ws.run_forever(ping_interval=ping_interval)
-        logging.info("WebSocket closed - reconnecting...")
-        time.sleep(WEBSOCKET_RECONNECT_DELAY)
+    ws.run_forever(ping_interval=ping_interval)
 
 thread = threading.Thread(target=run_ws)
 thread.daemon = True
@@ -329,7 +335,7 @@ def trading_loop():
             if current_time - last_trade_times.get(symbol, 0) < COOLDOWN_SEC:
                 logging.debug(f"Skipping {symbol} - in cooldown (last trade: {last_trade_times[symbol]})")
                 continue
-            deviation = (price - ema) / ema * 100 if ema > 0 else 0.0
+            deviation = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
             deviations[symbol] = deviation
             logging.debug(f"{symbol} deviation: {deviation:.2f}%")
             if deviation <= -THRESHOLD_PCT_BUY + THRESHOLD_TOLERANCE and balances['USDT'] >= TRADE_AMOUNT_USD:
@@ -417,7 +423,10 @@ def dashboard(stdscr):
             bal = balances.get(symbol, 0.0)
             inv = invested.get(symbol, 0.0)
             prof = coin_profits.get(symbol, 0.0)
-            total_value += bal * price if price > 0 else bal * emas[symbol] if emas[symbol] > 0 else 0.0
+            if price > 0:
+                total_value += bal * price
+            elif emas[symbol] > 0:
+                total_value += bal * emas[symbol]
             display_str = f"{idx}. {coin['name']} ({symbol}): ${price_str} ({change:+.2f}%) | Dev: {dev:+.2f}% | Bal: {bal:.4f} | Inv: ${inv:.2f} | Prof: ${prof:.2f}"
             stdscr.addstr(row, PADDING, display_str[:width-1 - PADDING], curses.color_pair(color))
             row += 1
