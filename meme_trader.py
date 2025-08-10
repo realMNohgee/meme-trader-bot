@@ -1,13 +1,13 @@
-# Meme Coin Day Trader Bot by Grok - Version 3.7.2
+# Meme Coin Day Trader Bot by Grok - Version 3.7.3
 # Uses KuCoin exchange for price data and simulation (fast, no location restrictions).
 # Selects top 5 meme coins by 24h volume on KuCoin via /api/v1/market/allTickers, filtered from known memes (no fallback).
 # Allocates $1 per trade, no cap on total investment per coin to allow thousands of trades/hour.
-# Sells for small profits initially (0.001% above EMA); if profit >50% of invested, increases sell threshold to 0.025%.
+# Sells only when profitable (profit > 0 after fee); if profit >50% of invested, increases sell threshold to 0.025%.
 # Title screen with ASCII art flair (inspired by retro terminal games like Asteroids/Pac-Man borders).
 # Main dashboard with borders, colors, and simple meme icons; shows live deviation and total value.
-# Fully automated trading (only q to quit or r to reset); INITIAL_BALANCE=50.0; sim fees (0.05% per trade).
+# Fully automated trading (q to quit, r to reset, s to sell all after 10s); INITIAL_BALANCE=50.0; sim fees (0.05% per trade).
 # KuCoin WebSocket: Fetches public token, connects to dynamic endpoint, subscribes to /market/ticker:SYMBOL-USDT individually with delays, with CCXT fallback.
-# Changes from v3.7.1: Fixed total_value calculation, reduced FEE_PCT to 0.0005, added WebSocket reconnect cap, kept thresholds at 0.001%.
+# Changes from v3.7.2: Sells only when profit > 0 after fee, added bid/ask prices, dynamic thresholds, COOLDOWN_SEC=0.5, CPU throttling, fixed sell-all with delay.
 import requests
 import websocket
 import json
@@ -16,6 +16,7 @@ import time
 import curses
 import ccxt
 import logging
+import psutil  # For CPU throttling
 
 # Section: Logging Setup
 logging.basicConfig(filename='bot_logs.txt', level=logging.DEBUG,
@@ -27,7 +28,7 @@ INITIAL_BALANCE = 50.0
 INITIAL_BUY_USD = 1.0
 TRADE_AMOUNT_USD = 1.0
 THRESHOLD_PCT_BUY = 0.001  # Buy if below EMA by 0.001%
-THRESHOLD_PCT_SELL_BASE = 0.001  # Sell if above EMA by 0.001%
+THRESHOLD_PCT_SELL_BASE = 0.001  # Base sell threshold, adjusted dynamically
 THRESHOLD_PCT_SELL_HIGH = 0.025
 PROFIT_HIGH_MARK = 0.5
 EMA_PERIOD = 30
@@ -39,9 +40,10 @@ WEBSOCKET_RECONNECT_DELAY = 5
 WEBSOCKET_MAX_RECONNECTS = 10
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2
-COOLDOWN_SEC = 5
+COOLDOWN_SEC = 0.5  # Reduced for more trades
 THRESHOLD_TOLERANCE = 0.0001
 TOKEN_RETRY_ATTEMPTS = 3
+start_time = time.time()
 
 # Section: Global Data
 prices = {}
@@ -57,6 +59,8 @@ total_profit = 0.0
 total_trades = 0
 debug_logs = []
 deviations = {}
+bid_prices = {}
+ask_prices = {}
 ws = None
 reconnect_attempts = 0
 
@@ -127,6 +131,8 @@ for coin in coins:
     invested[symbol] = 0.0
     coin_profits[symbol] = 0.0
     deviations[symbol] = 0.0
+    bid_prices[symbol] = 0.0
+    ask_prices[symbol] = 0.0
 
 # Section: KuCoin WebSocket Setup
 def get_kucoin_token():
@@ -163,8 +169,12 @@ def fetch_fallback_prices():
                 try:
                     ticker = exchange.fetch_ticker(symbol_pair)
                     price = float(ticker['last'])
+                    bid = float(ticker['bid'])
+                    ask = float(ticker['ask'])
                     prices[symbol] = price
-                    logging.debug(f"Fetched fallback price for {symbol}: ${price:.10f}")
+                    bid_prices[symbol] = bid
+                    ask_prices[symbol] = ask
+                    logging.debug(f"Fetched fallback price for {symbol}: ${price:.10f}, bid: ${bid:.10f}, ask: ${ask:.10f}")
                 except Exception as e:
                     logging.error(f"Failed to fetch fallback price for {symbol_pair}: {e}")
         time.sleep(60)  # Fetch every minute
@@ -184,10 +194,14 @@ def on_message(ws, message):
         symbol_pair = data['topic'].split(':')[1]
         symbol = symbol_pair.replace('-USDT', '')
         price = float(payload['price'])
+        bid = float(payload.get('bestBid', price))
+        ask = float(payload.get('bestAsk', price))
         change = 0.0
         if symbol in prices and prices[symbol] > 0:
             change = (price - prices[symbol]) / prices[symbol] * 100
         prices[symbol] = price
+        bid_prices[symbol] = bid
+        ask_prices[symbol] = ask
         changes[symbol] = change
         if symbol in price_histories:
             price_histories[symbol].append(price)
@@ -245,12 +259,14 @@ time.sleep(10)
 def execute_trade(symbol, side, amount_usd):
     global total_profit, total_trades
     price = prices.get(symbol, 0.0)
+    bid_price = bid_prices.get(symbol, price)
+    ask_price = ask_prices.get(symbol, price)
     if price == 0.0:
         log = f"Cannot {side} {symbol} - price not loaded yet!"
         debug_logs.append(log)
         logging.warning(log)
         return
-    quantity = amount_usd / price
+    quantity = amount_usd / (ask_price if side == 'buy' else price)
     fee = amount_usd * FEE_PCT
     if side == 'buy':
         if balances['USDT'] < amount_usd + fee:
@@ -270,9 +286,14 @@ def execute_trade(symbol, side, amount_usd):
             debug_logs.append(log)
             logging.warning(log)
             return
+        profit = amount_usd - (quantity * bid_price) - fee
+        if profit <= 0:
+            log = f"Skipped sell {symbol} - profit ${profit:.4f} not positive!"
+            debug_logs.append(log)
+            logging.debug(log)
+            return
         balances['USDT'] += (amount_usd - fee)
         balances[symbol] -= quantity
-        profit = amount_usd - (quantity * (emas[symbol] or price)) - fee
         coin_profits[symbol] += profit
         total_profit += profit
         log = f"Sold {quantity:.4f} {symbol} for ${amount_usd:.2f} (fee ${fee:.4f})! Profit: ${profit:.4f} 🤑"
@@ -282,6 +303,50 @@ def execute_trade(symbol, side, amount_usd):
     trade_logs.append(log)
     if len(trade_logs) > 10:
         trade_logs.pop(0)
+
+# Section: Sell All
+def sell_all():
+    global total_profit, total_trades
+    logging.info("Sell-all triggered, processing...")
+    if time.time() - start_time < 10:  # Wait for initial buys and prices
+        log = "Sell-all skipped - waiting for initial price data and balances!"
+        debug_logs.append(log)
+        logging.warning(log)
+        return
+    for coin in coins:
+        symbol = coin['symbol']
+        price = prices.get(symbol, 0.0)
+        bid_price = bid_prices.get(symbol, price)
+        if price == 0.0:
+            log = f"Cannot sell {symbol} - price not loaded yet!"
+            debug_logs.append(log)
+            logging.warning(log)
+            continue
+        balance = balances.get(symbol, 0.0)
+        if balance <= 0:
+            log = f"Cannot sell {symbol} - no balance to sell!"
+            debug_logs.append(log)
+            logging.warning(log)
+            continue
+        amount_usd = balance * price
+        fee = amount_usd * FEE_PCT
+        profit = amount_usd - (balance * bid_price) - fee
+        if profit <= 0:
+            log = f"Skipped sell all {symbol} - profit ${profit:.4f} not positive!"
+            debug_logs.append(log)
+            logging.debug(log)
+            continue
+        balances['USDT'] += (amount_usd - fee)
+        balances[symbol] = 0.0
+        coin_profits[symbol] += profit
+        total_profit += profit
+        log = f"Sold all {balance:.4f} {symbol} for ${amount_usd:.2f} (fee ${fee:.4f})! Profit: ${profit:.4f} 🤑"
+        debug_logs.append(log)
+        logging.info(log)
+        total_trades += 1
+        trade_logs.append(log)
+        if len(trade_logs) > 10:
+            trade_logs.pop(0)
 
 # Section: Initial Buys
 def initial_buys():
@@ -335,20 +400,52 @@ def trading_loop():
             if current_time - last_trade_times.get(symbol, 0) < COOLDOWN_SEC:
                 logging.debug(f"Skipping {symbol} - in cooldown (last trade: {last_trade_times[symbol]})")
                 continue
+            # Calculate volatility (standard deviation of last 30 prices)
+            price_history = price_histories.get(symbol, [])
+            if len(price_history) >= EMA_PERIOD:
+                mean = sum(price_history) / len(price_history)
+                variance = sum((x - mean) ** 2 for x in price_history) / len(price_history)
+                volatility = (variance ** 0.5) / mean if mean > 0 else 0.0
+                dynamic_threshold = THRESHOLD_PCT_SELL_BASE * (1 + volatility * 100)
+            else:
+                dynamic_threshold = THRESHOLD_PCT_SELL_BASE
             deviation = (price - emas[symbol]) / emas[symbol] * 100 if emas[symbol] > 0 else 0.0
             deviations[symbol] = deviation
-            logging.debug(f"{symbol} deviation: {deviation:.2f}%")
+            logging.debug(f"{symbol} deviation: {deviation:.2f}%, dynamic sell threshold: {dynamic_threshold:.3f}%")
             if deviation <= -THRESHOLD_PCT_BUY + THRESHOLD_TOLERANCE and balances['USDT'] >= TRADE_AMOUNT_USD:
                 execute_trade(symbol, 'buy', TRADE_AMOUNT_USD)
                 last_trade_times[symbol] = current_time
-            sell_threshold = THRESHOLD_PCT_SELL_HIGH if invested[symbol] > 0 and coin_profits[symbol] > invested[symbol] * PROFIT_HIGH_MARK else THRESHOLD_PCT_SELL_BASE
+            sell_threshold = THRESHOLD_PCT_SELL_HIGH if invested[symbol] > 0 and coin_profits[symbol] > invested[symbol] * PROFIT_HIGH_MARK else dynamic_threshold
             if deviation >= sell_threshold - THRESHOLD_TOLERANCE and balances[symbol] > (TRADE_AMOUNT_USD / price):
-                execute_trade(symbol, 'sell', TRADE_AMOUNT_USD)
-                last_trade_times[symbol] = current_time
-        time.sleep(0.1)  # Faster loop for high trade volume
+                profit = TRADE_AMOUNT_USD - ((TRADE_AMOUNT_USD / price) * bid_prices.get(symbol, price)) - (TRADE_AMOUNT_USD * FEE_PCT)
+                if profit > 0:
+                    execute_trade(symbol, 'sell', TRADE_AMOUNT_USD)
+                    last_trade_times[symbol] = current_time
+                else:
+                    log = f"Skipped sell {symbol} - profit ${profit:.4f} not positive!"
+                    debug_logs.append(log)
+                    logging.debug(log)
+        # CPU throttling
+        if psutil.cpu_percent() > 80:
+            time.sleep(0.2)
+        else:
+            time.sleep(0.1)  # Faster loop for high trade volume
+
 trade_thread = threading.Thread(target=trading_loop)
 trade_thread.daemon = True
 trade_thread.start()
+
+# Section: Key Input Handler
+def key_input(stdscr):
+    while True:
+        try:
+            key = stdscr.getch()
+            if key != -1 and chr(key).lower() in ['q', 'r', 's']:
+                debug_logs.append(f"Key pressed: {chr(key)}")
+                return chr(key).lower()
+        except:
+            pass
+        time.sleep(0.01)
 
 # Section: Title Screen
 def title_screen(stdscr):
@@ -398,7 +495,9 @@ def dashboard(stdscr):
     curses.init_pair(3, curses.COLOR_CYAN, -1)
     curses.init_pair(4, curses.COLOR_MAGENTA, -1)
     curses.init_pair(5, curses.COLOR_WHITE, -1)
-    instructions = "Automated trading running | r=reset | q=quit"
+    instructions = "Automated trading running | r=reset | q=quit | s=sell all holdings after 10s"
+    key_thread = threading.Thread(target=key_input, args=(stdscr,), daemon=True)
+    key_thread.start()
     while True:
         stdscr.clear()
         height, width = stdscr.getmaxyx()
@@ -452,12 +551,14 @@ def dashboard(stdscr):
             stdscr.addstr(row + 1, (width - 20) // 2, "To the Moon! 🌕🚀", curses.A_BOLD | curses.color_pair(1))
         stdscr.refresh()
         key = stdscr.getch()
-        if key != -1 and chr(key).lower() in ['q', 'r']:
+        if key != -1 and chr(key).lower() in ['q', 'r', 's']:
             debug_logs.append(f"Key pressed: {chr(key)}")
             if key == ord('q'):
                 break
             elif key == ord('r'):
                 reset_simulation()
+            elif key == ord('s'):
+                sell_all()
 
 # Section: Main Entry
 def main(stdscr):
